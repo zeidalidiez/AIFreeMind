@@ -1,0 +1,92 @@
+Implementation Plan: Local Persistent AI Brain with Agentic Tooling
+1. System Overview
+This application is a local, CLI-based Python assistant that maintains persistent state, formulates independent curiosity, and acts as an agentic development tool. It breaks the standard "single-prompt lifespan" by using local vector storage for memory and an event-driven reflection cycle.
+
+Core Stack:
+
+Language: Python 3.10+
+
+Routing & Tooling: litellm (Handles model-agnostic API calls and translates Python functions into LLM tool schemas).
+
+General Memory: chromadb (Local vector database for fast semantic retrieval of past context).
+
+Interface: rich or standard Python CLI.
+
+2. API Optimization Strategy (Event-Driven Reflection)
+To eliminate background API waste, the system operates on a batch-processing cycle:
+
+Active Loop: User and AI converse or execute tools. The session transcript is temporarily held in memory.
+
+Reflection Event: Triggered upon standard exit (e.g., Ctrl+C or typing /quit).
+
+The Mega-Prompt: The app sends one API call containing the session transcript with this system instruction: "Analyze the transcript. Output a JSON object with: memories (an array of 1-3 sentence summaries of new facts, plot points for short stories being tracked, or user preferences learned) and inbox_question (a single, curious question to ask the user next time based on these facts)."
+
+Storage: The memories are injected into ChromaDB. The inbox_question is saved locally.
+
+3. Tool Registry & Agentic Workflow
+The assistant is not just conversational; it can interact with the local environment. When a prompt requires action (like scaffolding HTML for a mini-site like Top Notch QA or reading a log file), the LLM will output a tool call instead of text. The application executes the local tool, returns the result to the LLM, and allows it to continue reasoning.
+
+4. Execution Steps for Antigravity Agent
+(Note to Agent: Execute these steps sequentially to build the application. Create artifacts as required).
+
+Phase 1: Project Scaffold & Dependencies
+
+Initialize a new Python environment.
+
+Create a requirements.txt: litellm, chromadb, python-dotenv, rich.
+
+Create the directory structure:
+
+/src/main.py (CLI interface and orchestrator)
+
+/src/memory.py (ChromaDB handler)
+
+/src/tools.py (Local execution functions)
+
+/src/llm_router.py (LiteLLM handler)
+
+/.env (For API keys or local base URLs)
+
+Phase 2: Implement General Memory (memory.py)
+
+Initialize a persistent ChromaDB client saving to ./db. Create a collection named general_memory.
+
+Create add_memory(text: str, metadata: dict) to generate embeddings and store them. Metadata should include a timestamp.
+
+Create query_memory(prompt: str, k=5) to find and return the 5 most semantically similar memories as a formatted string.
+
+Phase 3: Create the Tool Registry (tools.py)
+
+Implement the following core tools with explicit docstrings (the LLM requires docstrings to understand tool usage):
+
+read_file(filepath: str) -> str: Reads and returns the contents of a local file.
+
+write_file(filepath: str, content: str) -> str: Creates or overwrites a file with new content.
+
+run_command(command: str) -> str: Uses subprocess to run read-only terminal commands (like ls or cat) and returns standard output.
+
+Phase 4: Implement the LLM Router (llm_router.py)
+
+Configure LiteLLM to accept dynamic model strings.
+
+Create generate_response(messages: list, tools: list). This handles the actual API call, passing in the conversation history and the mapped tools from Phase 3.
+
+Create batch_reflect(transcript_text: str). Enforce a strict JSON output for memory consolidation and curiosity generation.
+
+Phase 5: Implement Orchestrator & Agentic Loop (main.py)
+
+Boot Sequence: Read the local inbox_question.txt file. If it exists, print it as the AI's proactive greeting, then delete the file.
+
+Input Loop: Accept user input via the CLI.
+
+Context Injection: Pass the input to query_memory. Append the retrieved memories to the system prompt invisibly.
+
+Agentic Execution (While Loop):
+
+Send the message history to generate_response.
+
+If the response contains tool_calls: Parse the tool name, execute the corresponding Python function in tools.py, append the output to the message history (role: "tool"), and loop back to generate_response.
+
+If the response is standard text: Print it to the user and break the while loop to await new user input.
+
+Shutdown Sequence: Catch the exit command. Trigger batch_reflect on the current session's transcript, save the extracted memories to ChromaDB, save the inbox_question to disk, and exit gracefully.

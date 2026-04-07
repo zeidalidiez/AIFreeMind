@@ -1,0 +1,21 @@
+# Environment & secrets
+.env
+
+# ChromaDB persistent storage
+db/
+
+# Session checkpoints
+checkpoints/
+
+# Curiosity persistence
+inbox_question.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
