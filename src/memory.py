@@ -62,24 +62,47 @@ class MemoryStore:
         )
         return memory_id
 
-    def add_memories(self, memories: list[str], source: str = "reflection") -> list[str]:
+    def add_memories(self, memories: list, source: str = "reflection") -> list[str]:
         """
         Batch-add memories from reflection output.
+        Accepts either:
+          - list of strings (legacy format)
+          - list of dicts with 'text' and 'domain' keys (tagged format)
         Returns list of generated IDs.
         """
         if not memories:
             return []
 
-        ids = [str(uuid.uuid4()) for _ in memories]
+        ids = []
+        documents = []
+        metadatas = []
         timestamp = datetime.now(timezone.utc).isoformat()
-        metadatas = [
-            {"timestamp": timestamp, "source": source}
-            for _ in memories
-        ]
+
+        for m in memories:
+            if isinstance(m, dict):
+                text = m.get("text", "")
+                domain = m.get("domain", "general")
+            else:
+                text = str(m)
+                domain = "general"
+
+            if not text.strip():
+                continue
+
+            ids.append(str(uuid.uuid4()))
+            documents.append(text)
+            metadatas.append({
+                "timestamp": timestamp,
+                "source": source,
+                "domain": domain,
+            })
+
+        if not ids:
+            return []
 
         self._collection.add(
             ids=ids,
-            documents=memories,
+            documents=documents,
             metadatas=metadatas,
         )
         return ids
@@ -159,7 +182,9 @@ class MemoryStore:
         for item in top:
             ts = item["metadata"].get("timestamp", "unknown")
             date_str = ts[:10] if len(ts) >= 10 else ts
-            entries.append(f"- [{date_str}] {item['document']}")
+            domain = item["metadata"].get("domain", "")
+            domain_tag = f" [{domain}]" if domain else ""
+            entries.append(f"- [{date_str}]{domain_tag} {item['document']}")
 
         return {"ids": ids, "entries": entries}
 
@@ -201,8 +226,10 @@ class MemoryStore:
             if similarity >= threshold:
                 ts = meta.get("timestamp", "unknown")
                 date_str = ts[:10] if len(ts) >= 10 else ts
+                domain = meta.get("domain", "")
+                domain_tag = f" [{domain}]" if domain else ""
                 ids.add(doc_id)
-                entries.append(f"- [{date_str}] {doc} (relevance: {similarity:.2f})")
+                entries.append(f"- [{date_str}]{domain_tag} {doc} (relevance: {similarity:.2f})")
 
             # Stop once we have enough
             if len(entries) >= k:

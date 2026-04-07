@@ -84,19 +84,19 @@ def generate_response(
 
 REFLECTION_SYSTEM_PROMPT = """You are a memory consolidation system. Analyze the conversation transcript and extract:
 
-1. "memories": An array of 1-5 concise summaries (1-3 sentences each) of:
-   - New facts about the user or their projects
-   - User preferences or working style
-   - Decisions made during the session
-   - Technical insights or solutions discovered
-   - Ongoing context valuable for future sessions
+1. "memories": An array of 1-5 memory objects. Each object has:
+   - "text": A concise 1-3 sentence summary capturing a fact, preference, decision, or insight.
+   - "domain": A short category tag for this memory. Use lowercase single words like:
+     "dev", "gaming", "fiction", "personal", "music", "design", "science", "general"
+     Pick the most specific domain that fits. Use "general" only if nothing else applies.
+   
    Each memory must be self-contained. Skip trivial small talk.
 
 2. "inbox_question": A single curious, specific follow-up question for next session that references something concrete from this conversation.
 
-IMPORTANT: Your entire response must be a single valid JSON object with keys "memories" and "inbox_question". Do not wrap in markdown code fences. Do not include any text before or after the JSON.
+IMPORTANT: Your entire response must be a single valid JSON object. Do not wrap in markdown code fences. Do not include any text before or after the JSON.
 
-{"memories": ["example memory 1", "example memory 2"], "inbox_question": "example question?"}"""
+{"memories": [{"text": "example memory", "domain": "dev"}, {"text": "another memory", "domain": "gaming"}], "inbox_question": "example question?"}"""
 
 
 def _extract_json(text: str) -> dict:
@@ -179,10 +179,23 @@ def batch_reflect(transcript: str, config: Config) -> dict:
         result = _extract_json(content)
 
         # Validate structure
-        memories = result.get("memories", [])
-        if not isinstance(memories, list):
-            memories = [str(memories)]
-        memories = [str(m) for m in memories if m]  # ensure strings, filter empty
+        raw_memories = result.get("memories", [])
+        if not isinstance(raw_memories, list):
+            raw_memories = [raw_memories]
+
+        # Normalize memories: accept both {"text": ..., "domain": ...} objects
+        # and plain strings (backward compatibility)
+        memories = []
+        for m in raw_memories:
+            if not m:
+                continue
+            if isinstance(m, dict):
+                text = str(m.get("text", "")).strip()
+                domain = str(m.get("domain", "general")).strip().lower()
+                if text:
+                    memories.append({"text": text, "domain": domain})
+            elif isinstance(m, str):
+                memories.append({"text": m.strip(), "domain": "general"})
 
         inbox = result.get("inbox_question", "")
         if not isinstance(inbox, str):

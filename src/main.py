@@ -17,7 +17,7 @@ from rich.text import Text
 from .config import Config, load_config
 from .llm_router import batch_reflect, generate_response
 from .memory import MemoryStore
-from .tools import TOOL_REGISTRY, get_tool_schemas
+from .tools import TOOL_REGISTRY, get_tool_schemas, is_safe_command
 
 console = Console()
 
@@ -120,7 +120,10 @@ def recover_crashed_session(config: Config, memory: MemoryStore):
         memory.add_memories(result["memories"], source="crash_recovery")
         console.print(f"  ✓ Recovered {len(result['memories'])} memories")
         for m in result["memories"]:
-            console.print(f"    • {m}", style="dim")
+            text = m["text"] if isinstance(m, dict) else m
+            domain = m.get("domain", "") if isinstance(m, dict) else ""
+            domain_tag = f" [{domain}]" if domain else ""
+            console.print(f"    •{domain_tag} {text}", style="dim")
 
     if result["inbox_question"]:
         config.inbox_path.write_text(result["inbox_question"], encoding="utf-8")
@@ -183,6 +186,24 @@ def handle_tool_calls(response_message, messages: list[dict]) -> bool:
             args = json.loads(tool_call.function.arguments)
         except json.JSONDecodeError:
             args = {}
+
+        # ── Command Sandboxing ──
+        # Safe commands auto-execute; unsafe commands require confirmation
+        if func_name == "run_command":
+            command = args.get("command", "")
+            if not is_safe_command(command):
+                console.print(f"\n  [yellow]⚠ AI wants to execute:[/yellow] [bold]{command}[/bold]")
+                try:
+                    answer = console.input("  [yellow]Allow? (y/n):[/yellow] ").strip().lower()
+                except EOFError:
+                    answer = "n"
+                if answer != "y":
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": "Command was denied by the user.",
+                    })
+                    continue
 
         console.print(f"  [dim]⚙ Running tool: {func_name}({', '.join(f'{k}={repr(v)[:50]}' for k, v in args.items())})[/dim]")
 
@@ -276,7 +297,10 @@ def shutdown(transcript: SessionTranscript, config: Config, memory: MemoryStore)
         memory.add_memories(result["memories"], source="reflection")
         console.print(f"\n[green]✓ Stored {len(result['memories'])} new memories:[/green]")
         for m in result["memories"]:
-            console.print(f"  • {m}", style="dim")
+            text = m["text"] if isinstance(m, dict) else m
+            domain = m.get("domain", "") if isinstance(m, dict) else ""
+            domain_tag = f" [bold]{domain}[/bold]" if domain else ""
+            console.print(f"  •{domain_tag} {text}", style="dim")
     else:
         console.print("[dim]No new memories extracted.[/dim]")
 
@@ -336,22 +360,35 @@ def main():
             break
 
         # Special commands
-        if user_input.lower() == "/memories":
+        if user_input.lower().startswith("/memories"):
+            # Parse optional domain filter: /memories dev
+            parts = user_input.strip().split(maxsplit=1)
+            domain_filter = parts[1].lower() if len(parts) > 1 else None
             count = memory.get_memory_count()
-            console.print(f"\n[cyan]Brain holds {count} memories.[/cyan]")
+            if domain_filter:
+                console.print(f"\n[cyan]Filtering by domain: {domain_filter}[/cyan]")
+            console.print(f"[cyan]Brain holds {count} total memories.[/cyan]")
             if count > 0:
-                memories = memory.get_all_memories(limit=20)
+                memories = memory.get_all_memories(limit=50)
+                shown = 0
                 for m in memories:
+                    domain = m["metadata"].get("domain", "general")
+                    if domain_filter and domain != domain_filter:
+                        continue
                     date = m["metadata"].get("timestamp", "")[:10]
-                    console.print(f"  [{date}] {m['document']}", style="dim")
+                    console.print(f"  [{date}] [bold]{domain}[/bold] {m['document']}", style="dim")
+                    shown += 1
+                if domain_filter:
+                    console.print(f"  ({shown} memories in '{domain_filter}')", style="dim")
             console.print()
             continue
 
         if user_input.lower() == "/help":
             console.print(Panel(
-                "/quit     — Exit and save memories\n"
-                "/memories — Browse stored memories\n"
-                "/help     — Show this help",
+                "/quit          — Exit and save memories\n"
+                "/memories      — Browse all stored memories\n"
+                "/memories dev  — Filter memories by domain\n"
+                "/help          — Show this help",
                 title="Commands",
                 border_style="dim",
             ))

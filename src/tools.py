@@ -103,6 +103,38 @@ def run_command(command: str) -> str:
         return f"Error running command: {e}"
 
 
+# ── Command Sandboxing ─────────────────────────────────────
+
+# Commands that start with these prefixes are considered safe (read-only)
+# and will auto-execute without user confirmation.
+SAFE_COMMAND_PREFIXES = [
+    # File listing / inspection
+    "ls", "dir", "cat", "type", "head", "tail", "find", "where",
+    "wc", "file", "stat", "tree",
+    # Environment info
+    "echo", "pwd", "whoami", "hostname", "uname", "env",
+    "printenv", "set",
+    # Version checks
+    "python --version", "python3 --version", "pip --version",
+    "node --version", "npm --version", "git --version",
+    # Git read operations
+    "git status", "git log", "git diff", "git branch", "git remote",
+    "git show", "git tag",
+    # Package inspection
+    "pip list", "pip show", "pip freeze",
+    "npm list", "npm ls", "npm info",
+]
+
+
+def is_safe_command(command: str) -> bool:
+    """
+    Check if a command is read-only / safe to auto-execute.
+    Returns True if the command starts with a known safe prefix.
+    """
+    cmd = command.strip().lower()
+    return any(cmd.startswith(prefix) for prefix in SAFE_COMMAND_PREFIXES)
+
+
 # ── Tool Registry ──────────────────────────────────────────
 
 

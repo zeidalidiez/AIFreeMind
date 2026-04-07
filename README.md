@@ -24,7 +24,7 @@ Boot → Crash Recovery → Inbox Question → Conversation Loop
 - **Dual Retrieval** — Combines the 25 most recent memories (working context) with up to 15 semantically relevant memories (deep recall), deduplicated.
 - **Batch Reflection** — On session exit, one efficient "mega-prompt" distills the conversation into stored memories and a curiosity question for next time.
 - **Crash Recovery** — Periodic transcript checkpoints ensure no session is lost, even on unexpected termination.
-- **Agentic Tools** — The AI can read/write files and run shell commands on your local machine.
+- **Agentic Tools** — The AI can read/write files and run shell commands on your local machine. Read-only commands (like `ls`, `git status`) auto-execute, while mutating commands (like `rm`, `pip install`) pause for strict **human-in-the-loop** confirmation to prevent destructive actions.
 
 ---
 
@@ -105,6 +105,7 @@ python -m src.main
 |---------|-------------|
 | `/quit` | Exit and save memories from this session |
 | `/memories` | Browse all stored memories |
+| `/memories [domain]`| Filter stored memories by a specific domain tag (e.g., `/memories dev`) |
 | `/help` | Show available commands |
 | `Ctrl+C` | Graceful exit (same as `/quit`) |
 
@@ -174,11 +175,13 @@ AIFreeMind works with any provider supported by LiteLLM, including:
 
 1. **During a session** — You converse normally. Before each LLM call, the brain surfaces relevant past context automatically.
 
-2. **On session exit** — A single reflection prompt distills the conversation into 1–5 concise memories and one follow-up question.
+2. **On session exit** — A single reflection prompt distills the conversation into 1–5 concise memories and one follow-up question. During this step, the AI automatically assigns a domain tag (e.g., `dev`, `fiction`, `personal`) to each memory.
 
 3. **On next session boot** — The follow-up question is displayed as a greeting. As you converse, past memories are retrieved through two channels:
    - **Recent** (25 most recent memories) — your short-term working context
    - **Relevant** (up to 15 semantically similar) — long-term topical recall
+
+   *Note on Memory Namespacing:* The domain tags generated during reflection help categorize concepts over time, minimizing cross-contamination (e.g. keeping D&D lore separated from Python dev context).
 
 4. **Over time** — The brain accumulates understanding of your projects, preferences, and ongoing work. The AI's context becomes richer with every session.
 
