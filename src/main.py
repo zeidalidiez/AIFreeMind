@@ -3,6 +3,9 @@ AIFreeMind — Main Orchestrator
 The CLI interface, agentic loop, and session lifecycle manager.
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import signal
 import sys
@@ -15,12 +18,15 @@ from rich.panel import Panel
 from rich.text import Text
 
 from .config import Config, load_config
-from .llm_router import batch_reflect, generate_response
+from .context import needs_trim, trim_messages
+from .llm_router import batch_reflect, generate_response, generate_response_stream
 from .memory import MemoryStore
-from .tools import TOOL_REGISTRY, get_tool_schemas, is_safe_command
+from .policy import ToolAction, decide_tool_permission
+from .tools import get_tool_schemas, make_tool_bindings
 
 console = Console()
 
+__version__ = "0.2.0"
 
 # ── System Prompt ──────────────────────────────────────────
 
@@ -28,7 +34,7 @@ SYSTEM_PROMPT = """You are AIFreeMind — a persistent AI assistant with evolvin
 
 Unlike typical AI conversations that start from scratch, you have access to memories from past sessions. These memories appear in your context when they're relevant. Use them naturally — reference past conversations, build on previous insights, and demonstrate continuity of thought.
 
-You also have access to local tools (reading files, writing files, running commands). Use them when the user's request requires interacting with their local environment.
+You also have access to local tools (reading files, writing files, running commands). Use them when the user's request requires interacting with their local environment. File writes and unsafe shell commands require user confirmation. Paths are confined to the workspace root unless the user has allowed outside access.
 
 Guidelines:
 - Be direct, concise, and helpful.
@@ -41,11 +47,7 @@ Guidelines:
 # ── Session Transcript ─────────────────────────────────────
 
 class SessionTranscript:
-    """
-    Maintains a human-readable transcript of the current session,
-    separate from the full message history (which includes system
-    prompts, tool calls, etc.).
-    """
+    """Human-readable transcript of the current session."""
 
     def __init__(self):
         self.exchanges: list[dict] = []
@@ -65,20 +67,17 @@ class SessionTranscript:
         return "\n".join(lines)
 
     def exchange_count(self) -> int:
-        """Count user-assistant exchange pairs."""
         return sum(1 for ex in self.exchanges if ex["role"] == "user")
 
 
 # ── Checkpointing ──────────────────────────────────────────
 
 def save_checkpoint(transcript: SessionTranscript, checkpoint_path: Path):
-    """Save the current transcript to a checkpoint file."""
     checkpoint_file = checkpoint_path / "session_checkpoint.txt"
     checkpoint_file.write_text(transcript.to_string(), encoding="utf-8")
 
 
 def load_checkpoint(checkpoint_path: Path) -> str | None:
-    """Check for an unsaved transcript from a crashed session."""
     checkpoint_file = checkpoint_path / "session_checkpoint.txt"
     if checkpoint_file.exists():
         content = checkpoint_file.read_text(encoding="utf-8")
@@ -88,7 +87,6 @@ def load_checkpoint(checkpoint_path: Path) -> str | None:
 
 
 def clear_checkpoint(checkpoint_path: Path):
-    """Remove checkpoint file after clean shutdown."""
     checkpoint_file = checkpoint_path / "session_checkpoint.txt"
     if checkpoint_file.exists():
         checkpoint_file.unlink()
@@ -97,10 +95,6 @@ def clear_checkpoint(checkpoint_path: Path):
 # ── Crash Recovery ─────────────────────────────────────────
 
 def recover_crashed_session(config: Config, memory: MemoryStore):
-    """
-    Check for a checkpoint from a previous crashed session.
-    If found, run reflection on it to salvage memories.
-    """
     saved_transcript = load_checkpoint(config.checkpoint_path)
     if not saved_transcript:
         return
@@ -126,8 +120,12 @@ def recover_crashed_session(config: Config, memory: MemoryStore):
             console.print(f"    •{domain_tag} {text}", style="dim")
 
     if result["inbox_question"]:
-        config.inbox_path.write_text(result["inbox_question"], encoding="utf-8")
-        console.print("  ✓ Saved recovered inbox question")
+        # Preserve existing inbox if present; only write if none
+        if not config.inbox_path.exists() or not config.inbox_path.read_text(encoding="utf-8").strip():
+            config.inbox_path.write_text(result["inbox_question"], encoding="utf-8")
+            console.print("  ✓ Saved recovered inbox question")
+        else:
+            console.print("  · Kept existing inbox question (not overwritten)")
 
     clear_checkpoint(config.checkpoint_path)
     console.print()
@@ -136,20 +134,19 @@ def recover_crashed_session(config: Config, memory: MemoryStore):
 # ── Boot Sequence ──────────────────────────────────────────
 
 def boot(config: Config, memory: MemoryStore):
-    """Display welcome message and inbox question."""
-
-    # Header
     console.print()
     console.print(
         Panel(
             Text("AIFreeMind", style="bold cyan", justify="center"),
-            subtitle=f"Model: {config.primary_model} | Memories: {memory.get_memory_count()}",
+            subtitle=(
+                f"Model: {config.primary_model} | Memories: {memory.get_memory_count()} | "
+                f"Tools: {config.tool_permission_mode.value}"
+            ),
             border_style="cyan",
             padding=(1, 4),
         )
     )
 
-    # Inbox question from last session
     if config.inbox_path.exists():
         question = config.inbox_path.read_text(encoding="utf-8").strip()
         if question:
@@ -162,23 +159,50 @@ def boot(config: Config, memory: MemoryStore):
             )
         config.inbox_path.unlink()
 
-    console.print("[dim]Type /quit to exit. Your memories persist between sessions.[/dim]\n")
+    console.print(
+        "[dim]Type /help for commands. /quit to exit. Multi-line: end a line with \\\\ then continue.[/dim]\n"
+    )
+
+
+# ── Input helpers ──────────────────────────────────────────
+
+def read_user_input() -> str:
+    """
+    Read user input; support multi-line when a line ends with a single backslash.
+    """
+    lines: list[str] = []
+    while True:
+        prompt = "[bold green]You:[/bold green] " if not lines else "[bold green]...[/bold green] "
+        try:
+            line = console.input(prompt)
+        except EOFError:
+            if lines:
+                break
+            raise
+        if line.endswith("\\") and not line.endswith("\\\\"):
+            lines.append(line[:-1])
+            continue
+        lines.append(line)
+        break
+    return "\n".join(lines).strip()
 
 
 # ── Agentic Loop ───────────────────────────────────────────
 
-def handle_tool_calls(response_message, messages: list[dict]) -> bool:
-    """
-    Process any tool calls in the LLM response.
-    Executes tools, appends results to message history.
-    Returns True if tool calls were processed.
-    """
+def handle_tool_calls(
+    response_message,
+    messages: list[dict],
+    config: Config,
+    tool_bindings: dict,
+) -> bool:
     tool_calls = getattr(response_message, "tool_calls", None)
     if not tool_calls:
         return False
 
-    # Append the assistant message with tool calls
-    messages.append(response_message.model_dump())
+    if hasattr(response_message, "model_dump"):
+        messages.append(response_message.model_dump())
+    else:
+        messages.append({"role": "assistant", "content": getattr(response_message, "content", None), "tool_calls": tool_calls})
 
     for tool_call in tool_calls:
         func_name = tool_call.function.name
@@ -187,33 +211,59 @@ def handle_tool_calls(response_message, messages: list[dict]) -> bool:
         except json.JSONDecodeError:
             args = {}
 
-        # ── Command Sandboxing ──
-        # Safe commands auto-execute; unsafe commands require confirmation
-        if func_name == "run_command":
-            command = args.get("command", "")
-            if not is_safe_command(command):
-                console.print(f"\n  [yellow]⚠ AI wants to execute:[/yellow] [bold]{command}[/bold]")
-                try:
-                    answer = console.input("  [yellow]Allow? (y/n):[/yellow] ").strip().lower()
-                except EOFError:
-                    answer = "n"
-                if answer != "y":
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": "Command was denied by the user.",
-                    })
-                    continue
+        action = decide_tool_permission(func_name, args, config.tool_permission_mode)
 
-        console.print(f"  [dim]⚙ Running tool: {func_name}({', '.join(f'{k}={repr(v)[:50]}' for k, v in args.items())})[/dim]")
+        if action == ToolAction.DENY:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": f"Tool '{func_name}' denied by tool permission mode ({config.tool_permission_mode.value}).",
+            })
+            console.print(f"  [red]✗ Denied tool: {func_name}[/red]")
+            continue
 
-        func = TOOL_REGISTRY.get(func_name)
+        if action == ToolAction.ASK:
+            if func_name == "run_command":
+                detail = args.get("command", "")
+                console.print(f"\n  [yellow]⚠ AI wants to execute:[/yellow] [bold]{detail}[/bold]")
+            elif func_name == "write_file":
+                path = args.get("filepath", "")
+                content = args.get("content", "")
+                preview = (content[:120] + "…") if len(str(content)) > 120 else content
+                console.print(
+                    f"\n  [yellow]⚠ AI wants to write file:[/yellow] [bold]{path}[/bold]\n"
+                    f"  [dim]preview: {preview!r}[/dim]"
+                )
+            else:
+                console.print(f"\n  [yellow]⚠ AI wants to run tool:[/yellow] [bold]{func_name}[/bold] {args}")
+            try:
+                answer = console.input("  [yellow]Allow? (y/n):[/yellow] ").strip().lower()
+            except EOFError:
+                answer = "n"
+            if answer != "y":
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": "Action was denied by the user.",
+                })
+                continue
+
+        console.print(
+            f"  [dim]⚙ Running tool: {func_name}("
+            f"{', '.join(f'{k}={repr(v)[:50]}' for k, v in args.items())})[/dim]"
+        )
+
+        func = tool_bindings.get(func_name)
         if func:
-            result = func(**args)
+            try:
+                result = func(**args)
+            except TypeError as e:
+                result = f"Error: bad arguments for {func_name}: {e}"
+            except Exception as e:
+                result = f"Error running {func_name}: {e}"
         else:
             result = f"Error: Unknown tool '{func_name}'"
 
-        # Append tool result to message history
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
@@ -223,65 +273,242 @@ def handle_tool_calls(response_message, messages: list[dict]) -> bool:
     return True
 
 
-def run_exchange(user_input: str, messages: list[dict], config: Config, memory: MemoryStore) -> str:
+def run_exchange(
+    user_input: str,
+    messages: list[dict],
+    config: Config,
+    memory: MemoryStore,
+    tool_bindings: dict,
+    preferred_domain: str | None = None,
+) -> tuple[str, bool]:
     """
-    Run a single user→AI exchange, including any tool call loops.
-    Returns the final assistant text response.
+    Run one user→AI exchange (including tool loops).
+    Returns (assistant_text, already_streamed_to_console).
     """
-    # Memory-first: query the brain before calling the LLM
-    memory_context = memory.query_memory(user_input)
+    memory_context = memory.query_memory(
+        user_input,
+        preferred_domain=preferred_domain,
+    )
 
-    # Build the system message with injected memories
     system_content = SYSTEM_PROMPT
     if memory_context:
         system_content += f"\n\n{memory_context}"
 
-    # Update or set the system message
-    if messages and messages[0]["role"] == "system":
+    if messages and messages[0].get("role") == "system":
         messages[0]["content"] = system_content
     else:
         messages.insert(0, {"role": "system", "content": system_content})
 
-    # Add user message
     messages.append({"role": "user", "content": user_input})
 
-    # Tool schemas
+    if needs_trim(
+        messages,
+        max_messages=config.context_max_messages,
+        max_chars=config.context_max_chars,
+    ):
+        trimmed = trim_messages(
+            messages,
+            max_messages=config.context_max_messages,
+            max_chars=config.context_max_chars,
+        )
+        messages.clear()
+        messages.extend(trimmed)
+        console.print("[dim]· Context trimmed to fit window[/dim]")
+
     tools = get_tool_schemas()
 
-    # Agentic loop: keep going while the LLM wants to call tools
-    max_iterations = 10  # safety limit
-    for _ in range(max_iterations):
+    max_iterations = 10
+    for _iteration in range(max_iterations):
+        stream_state = {"started": False}
+
+        def _on_token(piece: str, state=stream_state):
+            if not state["started"]:
+                console.print()
+                state["started"] = True
+            console.print(piece, end="", highlight=False)
+
         try:
-            response = generate_response(messages, tools, config)
+            response = generate_response_stream(
+                messages,
+                tools,
+                config,
+                on_token=_on_token if config.stream_responses else None,
+            )
         except Exception as e:
             error_msg = f"[Error communicating with LLM: {e}]"
             console.print(f"[red]{error_msg}[/red]")
-            return error_msg
+            return error_msg, False
+
+        if stream_state["started"]:
+            console.print()
 
         response_message = response.choices[0].message
 
-        # If there are tool calls, execute them and loop back
-        if handle_tool_calls(response_message, messages):
+        if handle_tool_calls(response_message, messages, config, tool_bindings):
             continue
 
-        # Otherwise, we have a text response — we're done
         assistant_text = response_message.content or ""
         messages.append({"role": "assistant", "content": assistant_text})
-        return assistant_text
+        return assistant_text, stream_state["started"]
 
-    # Safety: too many tool iterations
     fallback = "[Reached maximum tool iterations. Please try rephrasing your request.]"
     messages.append({"role": "assistant", "content": fallback})
-    return fallback
+    return fallback, False
+
+
+# ── Slash commands ─────────────────────────────────────────
+
+def cmd_help():
+    console.print(Panel(
+        "/quit                  — Exit and save memories\n"
+        "/memories [domain]     — Browse memories (newest first, full store)\n"
+        "/search <query>        — Semantic search memories\n"
+        "/domains               — List domain tags and counts\n"
+        "/delete <id>           — Delete a memory by ID (prefix ok if unique)\n"
+        "/remember <text>       — Store a memory now (optional: /remember domain:dev text)\n"
+        "/consolidate           — Dedup near-duplicate memories\n"
+        "/help                  — Show this help\n"
+        "Multi-line input       — End a line with \\ to continue on the next line",
+        title="Commands",
+        border_style="dim",
+    ))
+
+
+def _resolve_id_prefix(memory: MemoryStore, prefix: str) -> str | None:
+    prefix = prefix.strip()
+    if not prefix:
+        return None
+    items = memory.list_memories(limit=None)
+    matches = [it for it in items if it["id"] == prefix or it["id"].startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]["id"]
+    if len(matches) > 1:
+        console.print(f"[yellow]Ambiguous id prefix '{prefix}' ({len(matches)} matches). Use more characters.[/yellow]")
+        return None
+    return None
+
+
+def handle_slash_command(user_input: str, memory: MemoryStore) -> bool:
+    """Return True if the input was a handled slash command (not chat)."""
+    lower = user_input.lower().strip()
+    if lower in ("/help",):
+        cmd_help()
+        return True
+
+    if lower.startswith("/memories"):
+        parts = user_input.strip().split(maxsplit=1)
+        domain_filter = parts[1].lower() if len(parts) > 1 else None
+        count = memory.get_memory_count()
+        if domain_filter:
+            console.print(f"\n[cyan]Filtering by domain: {domain_filter}[/cyan]")
+        console.print(f"[cyan]Brain holds {count} total memories.[/cyan]")
+        memories = memory.list_memories(limit=None, domain=domain_filter)
+        shown = 0
+        for m in memories:
+            domain = m["metadata"].get("domain", "general")
+            date = m["metadata"].get("timestamp", "")[:10]
+            mid = m["id"][:8]
+            console.print(f"  [{date}] [{mid}] [bold]{domain}[/bold] {m['document']}", style="dim")
+            shown += 1
+        if domain_filter:
+            console.print(f"  ({shown} memories in '{domain_filter}')", style="dim")
+        elif shown:
+            console.print(f"  ({shown} shown)", style="dim")
+        console.print()
+        return True
+
+    if lower == "/domains":
+        domains = memory.list_domains()
+        if not domains:
+            console.print("[dim]No domains yet.[/dim]\n")
+            return True
+        console.print("[cyan]Domains:[/cyan]")
+        for name, n in domains:
+            console.print(f"  [bold]{name}[/bold]: {n}")
+        console.print()
+        return True
+
+    if lower.startswith("/search"):
+        parts = user_input.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            console.print("[yellow]Usage: /search <query>[/yellow]\n")
+            return True
+        hits = memory.search_memories(parts[1].strip(), k=10)
+        if not hits:
+            console.print("[dim]No matches.[/dim]\n")
+            return True
+        console.print(f"[cyan]Search results ({len(hits)}):[/cyan]")
+        for h in hits:
+            mid = h["id"][:8]
+            domain = h["metadata"].get("domain", "general")
+            console.print(
+                f"  [{mid}] [bold]{domain}[/bold] ({h['similarity']:.2f}) {h['document']}",
+                style="dim",
+            )
+        console.print()
+        return True
+
+    if lower.startswith("/delete"):
+        parts = user_input.strip().split(maxsplit=1)
+        if len(parts) < 2:
+            console.print("[yellow]Usage: /delete <memory-id-or-prefix>[/yellow]\n")
+            return True
+        mid = _resolve_id_prefix(memory, parts[1].strip())
+        if not mid:
+            console.print("[red]Memory not found.[/red]\n")
+            return True
+        if memory.delete_memory(mid):
+            console.print(f"[green]✓ Deleted {mid}[/green]\n")
+        else:
+            console.print("[red]Delete failed.[/red]\n")
+        return True
+
+    if lower.startswith("/remember"):
+        rest = user_input.strip()[len("/remember"):].strip()
+        if not rest:
+            console.print("[yellow]Usage: /remember [domain:tag] <text>[/yellow]\n")
+            return True
+        domain = "general"
+        text = rest
+        if rest.lower().startswith("domain:"):
+            # domain:dev the rest of the text
+            after = rest[7:]
+            if " " in after:
+                domain, text = after.split(None, 1)
+            else:
+                domain, text = after, ""
+            domain = domain.strip().lower() or "general"
+            text = text.strip()
+        if not text:
+            console.print("[yellow]Usage: /remember [domain:tag] <text>[/yellow]\n")
+            return True
+        mid = memory.remember(text, domain=domain)
+        console.print(f"[green]✓ Remembered[/green] [{domain}] {text} [dim]({mid[:8]})[/dim]\n")
+        return True
+
+    if lower in ("/consolidate",):
+        console.print("[cyan]Consolidating near-duplicate memories...[/cyan]")
+        stats = memory.consolidate_memories()
+        console.print(
+            f"[green]✓ Removed {stats['removed']} duplicates; "
+            f"{stats['kept']} memories remain.[/green]\n"
+        )
+        return True
+
+    return False
 
 
 # ── Shutdown Sequence ──────────────────────────────────────
 
+_shutting_down = False
+
+
 def shutdown(transcript: SessionTranscript, config: Config, memory: MemoryStore):
-    """
-    Clean shutdown: reflect on the session, store memories,
-    save inbox question, clean up checkpoint.
-    """
+    global _shutting_down
+    if _shutting_down:
+        return
+    _shutting_down = True
+
     console.print("\n[cyan]Reflecting on this session...[/cyan]")
 
     transcript_text = transcript.to_string()
@@ -292,7 +519,6 @@ def shutdown(transcript: SessionTranscript, config: Config, memory: MemoryStore)
 
     result = batch_reflect(transcript_text, config)
 
-    # Store memories
     if result["memories"]:
         memory.add_memories(result["memories"], source="reflection")
         console.print(f"\n[green]✓ Stored {len(result['memories'])} new memories:[/green]")
@@ -304,13 +530,11 @@ def shutdown(transcript: SessionTranscript, config: Config, memory: MemoryStore)
     else:
         console.print("[dim]No new memories extracted.[/dim]")
 
-    # Save inbox question
     if result["inbox_question"]:
         config.inbox_path.write_text(result["inbox_question"], encoding="utf-8")
-        console.print(f"\n[magenta]💭 Question for next time:[/magenta]")
+        console.print("\n[magenta]💭 Question for next time:[/magenta]")
         console.print(f"  [italic]{result['inbox_question']}[/italic]")
 
-    # Clean up checkpoint
     clear_checkpoint(config.checkpoint_path)
 
     total = memory.get_memory_count()
@@ -319,101 +543,86 @@ def shutdown(transcript: SessionTranscript, config: Config, memory: MemoryStore)
 
 # ── Main Entry Point ──────────────────────────────────────
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="aifreemind",
+        description="AIFreeMind — persistent local AI agent with memory",
+    )
+    p.add_argument("--version", action="version", version=f"AIFreeMind {__version__}")
+    p.add_argument(
+        "--help-commands",
+        action="store_true",
+        help="Print in-session slash commands and exit",
+    )
+    return p
+
+
+def main(argv: list[str] | None = None):
     """AIFreeMind CLI entry point."""
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
 
-    # Load config
+    if args.help_commands:
+        cmd_help()
+        return 0
+
     config = load_config()
-
-    # Initialize memory
     memory = MemoryStore(config)
+    tool_bindings = make_tool_bindings(
+        config.workspace_root,
+        allow_outside=config.allow_outside_workspace,
+    )
 
-    # Crash recovery
     recover_crashed_session(config, memory)
-
-    # Boot
     boot(config, memory)
 
-    # Session state
     messages: list[dict] = []
     transcript = SessionTranscript()
 
-    # Handle Ctrl+C gracefully
     def signal_handler(sig, frame):
         shutdown(transcript, config, memory)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Main input loop
     while True:
         try:
-            user_input = console.input("[bold green]You:[/bold green] ").strip()
+            user_input = read_user_input()
         except EOFError:
             break
 
         if not user_input:
             continue
 
-        # Exit commands
         if user_input.lower() in ("/quit", "/exit", "quit", "exit"):
             break
 
-        # Special commands
-        if user_input.lower().startswith("/memories"):
-            # Parse optional domain filter: /memories dev
-            parts = user_input.strip().split(maxsplit=1)
-            domain_filter = parts[1].lower() if len(parts) > 1 else None
-            count = memory.get_memory_count()
-            if domain_filter:
-                console.print(f"\n[cyan]Filtering by domain: {domain_filter}[/cyan]")
-            console.print(f"[cyan]Brain holds {count} total memories.[/cyan]")
-            if count > 0:
-                memories = memory.get_all_memories(limit=50)
-                shown = 0
-                for m in memories:
-                    domain = m["metadata"].get("domain", "general")
-                    if domain_filter and domain != domain_filter:
-                        continue
-                    date = m["metadata"].get("timestamp", "")[:10]
-                    console.print(f"  [{date}] [bold]{domain}[/bold] {m['document']}", style="dim")
-                    shown += 1
-                if domain_filter:
-                    console.print(f"  ({shown} memories in '{domain_filter}')", style="dim")
-            console.print()
-            continue
+        if user_input.startswith("/"):
+            if handle_slash_command(user_input, memory):
+                continue
+            # Unknown slash — fall through to chat so model can respond
+            console.print(f"[dim]Unknown command (sending to model): {user_input.split()[0]}[/dim]")
 
-        if user_input.lower() == "/help":
-            console.print(Panel(
-                "/quit          — Exit and save memories\n"
-                "/memories      — Browse all stored memories\n"
-                "/memories dev  — Filter memories by domain\n"
-                "/help          — Show this help",
-                title="Commands",
-                border_style="dim",
-            ))
-            continue
-
-        # Run the exchange
         transcript.add_user(user_input)
-        response_text = run_exchange(user_input, messages, config, memory)
+        response_text, already_streamed = run_exchange(
+            user_input, messages, config, memory, tool_bindings
+        )
         transcript.add_assistant(response_text)
 
-        # Display response
-        console.print()
-        try:
-            console.print(Markdown(response_text))
-        except Exception:
-            console.print(response_text)
+        if not already_streamed:
+            console.print()
+            try:
+                console.print(Markdown(response_text))
+            except Exception:
+                console.print(response_text)
         console.print()
 
-        # Periodic checkpoint
         if transcript.exchange_count() % config.checkpoint_interval == 0:
             save_checkpoint(transcript, config.checkpoint_path)
 
-    # Clean shutdown
     shutdown(transcript, config, memory)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

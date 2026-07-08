@@ -5,33 +5,60 @@ Each tool has an explicit docstring that LiteLLM uses to generate
 the OpenAI-compatible tool/function schema for the LLM.
 """
 
+from __future__ import annotations
+
 import subprocess
-import sys
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
+
+from .policy import (
+    SAFE_COMMAND_PREFIXES,
+    is_safe_command,
+    resolve_under_root,
+)
 
 
-# ── Core Tools ──────────────────────────────────────────────
+# Re-export for callers that imported from tools historically
+__all__ = [
+    "read_file",
+    "write_file",
+    "run_command",
+    "is_safe_command",
+    "SAFE_COMMAND_PREFIXES",
+    "TOOL_REGISTRY",
+    "get_tool_schemas",
+    "make_tool_bindings",
+]
 
 
-def read_file(filepath: str) -> str:
+def read_file(
+    filepath: str,
+    *,
+    workspace_root: Optional[Path] = None,
+    allow_outside: bool = False,
+) -> str:
     """Read and return the contents of a local file.
-    
+
     Args:
         filepath: The path to the file to read. Can be absolute or relative.
-    
+        workspace_root: Optional jail root (defaults to cwd if omitted).
+        allow_outside: If True, skip workspace jail.
+
     Returns:
         The full text content of the file, or an error message if the file
         cannot be read.
     """
+    root = workspace_root if workspace_root is not None else Path.cwd()
+    path, err = resolve_under_root(filepath, root, allow_outside=allow_outside)
+    if err:
+        return err
+    assert path is not None
     try:
-        path = Path(filepath).resolve()
         if not path.exists():
             return f"Error: File not found: {path}"
         if not path.is_file():
             return f"Error: Not a file: {path}"
         content = path.read_text(encoding="utf-8", errors="replace")
-        # Truncate very large files to avoid blowing up context
         max_chars = 50_000
         if len(content) > max_chars:
             return content[:max_chars] + f"\n\n... [truncated, file is {len(content)} chars total]"
@@ -40,19 +67,31 @@ def read_file(filepath: str) -> str:
         return f"Error reading file: {e}"
 
 
-def write_file(filepath: str, content: str) -> str:
+def write_file(
+    filepath: str,
+    content: str,
+    *,
+    workspace_root: Optional[Path] = None,
+    allow_outside: bool = False,
+) -> str:
     """Create or overwrite a file with the given content.
-    
+
     Args:
         filepath: The path where the file should be written. Parent directories
                   will be created if they don't exist.
         content: The text content to write to the file.
-    
+        workspace_root: Optional jail root (defaults to cwd if omitted).
+        allow_outside: If True, skip workspace jail.
+
     Returns:
         A success message with the file path, or an error message.
     """
+    root = workspace_root if workspace_root is not None else Path.cwd()
+    path, err = resolve_under_root(filepath, root, allow_outside=allow_outside)
+    if err:
+        return err
+    assert path is not None
     try:
-        path = Path(filepath).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return f"Successfully wrote {len(content)} characters to {path}"
@@ -62,14 +101,14 @@ def write_file(filepath: str, content: str) -> str:
 
 def run_command(command: str) -> str:
     """Execute a terminal command and return its output.
-    
+
     Runs the command in a subprocess and captures both stdout and stderr.
     Has a 30-second timeout to prevent hanging.
-    
+
     Args:
         command: The shell command to execute (e.g., 'ls -la', 'cat file.txt',
                  'python --version').
-    
+
     Returns:
         The combined stdout and stderr output, or an error message if the
         command fails or times out.
@@ -92,7 +131,6 @@ def run_command(command: str) -> str:
             output += f"\n[Exit code: {result.returncode}]"
         if not output.strip():
             output = "[Command completed with no output]"
-        # Truncate very long output
         max_chars = 10_000
         if len(output) > max_chars:
             output = output[:max_chars] + f"\n... [truncated, output is {len(output)} chars total]"
@@ -103,41 +141,37 @@ def run_command(command: str) -> str:
         return f"Error running command: {e}"
 
 
-# ── Command Sandboxing ─────────────────────────────────────
-
-# Commands that start with these prefixes are considered safe (read-only)
-# and will auto-execute without user confirmation.
-SAFE_COMMAND_PREFIXES = [
-    # File listing / inspection
-    "ls", "dir", "cat", "type", "head", "tail", "find", "where",
-    "wc", "file", "stat", "tree",
-    # Environment info
-    "echo", "pwd", "whoami", "hostname", "uname", "env",
-    "printenv", "set",
-    # Version checks
-    "python --version", "python3 --version", "pip --version",
-    "node --version", "npm --version", "git --version",
-    # Git read operations
-    "git status", "git log", "git diff", "git branch", "git remote",
-    "git show", "git tag",
-    # Package inspection
-    "pip list", "pip show", "pip freeze",
-    "npm list", "npm ls", "npm info",
-]
-
-
-def is_safe_command(command: str) -> bool:
+def make_tool_bindings(
+    workspace_root: Path,
+    allow_outside: bool = False,
+) -> dict[str, Callable]:
     """
-    Check if a command is read-only / safe to auto-execute.
-    Returns True if the command starts with a known safe prefix.
+    Build callables bound to workspace jail settings for the agent loop.
     """
-    cmd = command.strip().lower()
-    return any(cmd.startswith(prefix) for prefix in SAFE_COMMAND_PREFIXES)
+
+    def _read(filepath: str) -> str:
+        return read_file(
+            filepath,
+            workspace_root=workspace_root,
+            allow_outside=allow_outside,
+        )
+
+    def _write(filepath: str, content: str) -> str:
+        return write_file(
+            filepath,
+            content,
+            workspace_root=workspace_root,
+            allow_outside=allow_outside,
+        )
+
+    return {
+        "read_file": _read,
+        "write_file": _write,
+        "run_command": run_command,
+    }
 
 
-# ── Tool Registry ──────────────────────────────────────────
-
-
+# Default registry (cwd jail) — prefer make_tool_bindings in production
 TOOL_REGISTRY: dict[str, Callable] = {
     "read_file": read_file,
     "write_file": write_file,
@@ -155,13 +189,13 @@ def get_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read and return the contents of a local file.",
+                "description": "Read and return the contents of a local file within the workspace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "filepath": {
                             "type": "string",
-                            "description": "The path to the file to read. Can be absolute or relative.",
+                            "description": "The path to the file to read. Can be absolute or relative to workspace.",
                         }
                     },
                     "required": ["filepath"],
@@ -172,7 +206,10 @@ def get_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file with the given content.",
+                "description": (
+                    "Create or overwrite a file with the given content. "
+                    "Requires user confirmation before writing. Paths are confined to the workspace."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -193,7 +230,10 @@ def get_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": "Execute a terminal command and return its output. Has a 30-second timeout.",
+                "description": (
+                    "Execute a terminal command and return its output. Has a 30-second timeout. "
+                    "Unsafe/mutating commands require user confirmation."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {

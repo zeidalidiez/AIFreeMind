@@ -1,4 +1,8 @@
-litellm
-chromadb
-python-dotenv
-rich
+# Runtime (pinned ranges — install with: pip install -r requirements.txt)
+litellm>=1.55.0,<2
+chromadb>=0.5.0,<2
+python-dotenv>=1.0.0,<2
+rich>=13.0.0,<15
+
+# Dev / tests
+pytest>=8.0.0,<9

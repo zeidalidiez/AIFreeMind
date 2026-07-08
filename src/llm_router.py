@@ -1,12 +1,13 @@
 """
 AIFreeMind LLM Router
 Model-agnostic LLM communication via LiteLLM.
-Handles primary/fallback routing and batch reflection.
+Handles primary/fallback routing, streaming, and batch reflection.
 """
 
+from __future__ import annotations
+
 import json
-import os
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import litellm
 
@@ -14,72 +15,198 @@ from .config import Config
 
 # Suppress LiteLLM's verbose logging
 litellm.suppress_debug_info = True
-litellm.set_verbose = False
+try:
+    litellm.set_verbose = False
+except Exception:
+    pass
+
+
+def _completion_kwargs(
+    model: str,
+    messages: list[dict],
+    tools: Optional[list[dict]],
+    api_base: str,
+    *,
+    stream: bool = False,
+) -> dict:
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+    if api_base:
+        kwargs["api_base"] = api_base
+    if stream:
+        kwargs["stream"] = True
+    return kwargs
+
+
+def primary_api_base_for(config: Config) -> str:
+    """Public helper for tests — which base URL primary uses."""
+    return (config.primary_api_base or "").strip()
 
 
 def generate_response(
     messages: list[dict],
     tools: list[dict],
     config: Config,
-) -> dict:
+) -> Any:
     """
-    Send a conversation to the LLM and get a response.
-    
-    Tries the primary model first. If it fails, falls back to the
-    fallback model (if configured). Returns the raw LiteLLM response.
-    
-    Args:
-        messages: OpenAI-format message list (role + content)
-        tools: OpenAI-format tool schemas
-        config: App configuration with model strings
-    
-    Returns:
-        The LiteLLM response object (has .choices[0].message)
-    
-    Raises:
-        Exception: If both primary and fallback models fail
-    """
-    # Try primary model
-    try:
-        kwargs = {
-            "model": config.primary_model,
-            "messages": messages,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+    Send a conversation to the LLM and get a response (non-streaming).
 
-        response = litellm.completion(**kwargs)
-        return response
+    Tries the primary model first (honoring PRIMARY_API_BASE).
+    Falls back if configured.
+    """
+    try:
+        kwargs = _completion_kwargs(
+            config.primary_model,
+            messages,
+            tools,
+            config.primary_api_base,
+            stream=False,
+        )
+        return litellm.completion(**kwargs)
 
     except Exception as primary_err:
-        # If no fallback configured, raise the primary error
         if not config.fallback_model:
             raise Exception(
                 f"Primary model ({config.primary_model}) failed: {primary_err}"
             ) from primary_err
 
-        # Try fallback
         try:
-            kwargs = {
-                "model": config.fallback_model,
-                "messages": messages,
-            }
-            if tools:
-                kwargs["tools"] = tools
-                kwargs["tool_choice"] = "auto"
-            if config.fallback_api_base:
-                kwargs["api_base"] = config.fallback_api_base
-
-            response = litellm.completion(**kwargs)
-            return response
-
+            kwargs = _completion_kwargs(
+                config.fallback_model,
+                messages,
+                tools,
+                config.fallback_api_base,
+                stream=False,
+            )
+            return litellm.completion(**kwargs)
         except Exception as fallback_err:
             raise Exception(
                 f"Both models failed.\n"
                 f"  Primary ({config.primary_model}): {primary_err}\n"
                 f"  Fallback ({config.fallback_model}): {fallback_err}"
             ) from fallback_err
+
+
+def generate_response_stream(
+    messages: list[dict],
+    tools: list[dict],
+    config: Config,
+    on_token: Optional[Callable[[str], None]] = None,
+) -> Any:
+    """
+    Stream a completion when STREAM_RESPONSES is enabled; fall back to non-streaming.
+
+    Tool schemas may be present (CLI always offers tools). Text deltas go to
+    on_token; tool_call fragments are accumulated into a final message so the
+    agent loop still works. On stream failure, falls back to generate_response.
+    """
+    if not config.stream_responses:
+        return generate_response(messages, tools, config)
+
+    try:
+        kwargs = _completion_kwargs(
+            config.primary_model,
+            messages,
+            tools if tools else None,
+            config.primary_api_base,
+            stream=True,
+        )
+        stream = litellm.completion(**kwargs)
+        chunks: list[str] = []
+        # tool_call index -> {id, name, arguments}
+        tool_acc: dict[int, dict[str, str]] = {}
+
+        for chunk in stream:
+            try:
+                delta = chunk.choices[0].delta
+            except Exception:
+                continue
+            piece = getattr(delta, "content", None) or ""
+            if piece:
+                chunks.append(piece)
+                if on_token:
+                    on_token(piece)
+            tcs = getattr(delta, "tool_calls", None) or []
+            for tc in tcs:
+                idx = getattr(tc, "index", 0) or 0
+                slot = tool_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if getattr(tc, "id", None):
+                    slot["id"] = tc.id
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        slot["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        slot["arguments"] += fn.arguments or ""
+
+        full = "".join(chunks)
+        tool_calls = None
+        if tool_acc:
+            class _Fn:
+                def __init__(self, name: str, arguments: str):
+                    self.name = name
+                    self.arguments = arguments
+
+            class _Tc:
+                def __init__(self, id_: str, name: str, arguments: str):
+                    self.id = id_ or "call_0"
+                    self.type = "function"
+                    self.function = _Fn(name, arguments)
+
+                def model_dump(self):
+                    return {
+                        "id": self.id,
+                        "type": "function",
+                        "function": {
+                            "name": self.function.name,
+                            "arguments": self.function.arguments,
+                        },
+                    }
+
+            tool_calls = [
+                _Tc(v["id"], v["name"], v["arguments"])
+                for _, v in sorted(tool_acc.items())
+            ]
+
+        class _Msg:
+            def __init__(self, content: str, tool_calls):
+                self.content = content
+                self.tool_calls = tool_calls
+                self.role = "assistant"
+
+            def model_dump(self):
+                d: dict[str, Any] = {"role": "assistant", "content": self.content}
+                if self.tool_calls:
+                    d["tool_calls"] = [
+                        tc.model_dump() if hasattr(tc, "model_dump") else tc
+                        for tc in self.tool_calls
+                    ]
+                return d
+
+        class _Choice:
+            def __init__(self, msg):
+                self.message = msg
+
+        class _Resp:
+            def __init__(self, msg):
+                self.choices = [_Choice(msg)]
+
+        content_out: Any
+        if full:
+            content_out = full
+        elif tool_calls:
+            content_out = None
+        else:
+            content_out = ""
+        return _Resp(_Msg(content_out, tool_calls))
+
+    except Exception:
+        return generate_response(messages, tools, config)
 
 
 REFLECTION_SYSTEM_PROMPT = """You are a memory consolidation system. Analyze the conversation transcript and extract:
@@ -110,20 +237,16 @@ def _extract_json(text: str) -> dict:
 
     # Strip markdown code fences if present
     if cleaned.startswith("```"):
-        # Remove opening fence (with optional language tag)
         first_newline = cleaned.index("\n") if "\n" in cleaned else len(cleaned)
         cleaned = cleaned[first_newline + 1:]
-        # Remove closing fence
         if cleaned.rstrip().endswith("```"):
             cleaned = cleaned.rstrip()[:-3].rstrip()
 
-    # Try parsing directly
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Try to find JSON object within the text
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -135,20 +258,14 @@ def _extract_json(text: str) -> dict:
     raise json.JSONDecodeError("Could not extract JSON from response", cleaned, 0)
 
 
+# Public alias for tests
+extract_json = _extract_json
+
+
 def batch_reflect(transcript: str, config: Config) -> dict:
     """
     The "mega-prompt" — analyzes a full session transcript and extracts
     structured memories and a curiosity question for next session.
-    
-    Uses the reflection model (which may be cheaper than the chat model).
-    
-    Args:
-        transcript: The full session transcript as a string
-        config: App configuration
-    
-    Returns:
-        Dict with 'memories' (list[str]) and 'inbox_question' (str)
-        Returns empty defaults if reflection fails.
     """
     if not transcript.strip():
         return {"memories": [], "inbox_question": ""}
@@ -158,16 +275,16 @@ def batch_reflect(transcript: str, config: Config) -> dict:
         {"role": "user", "content": f"Here is the session transcript to analyze:\n\n{transcript}"},
     ]
 
+    content = ""
     try:
-        # Use reflection model (may differ from chat model)
-        kwargs = {
-            "model": config.reflect_model,
-            "messages": messages,
-        }
-        # If reflect model is the fallback (ollama), pass its API base
-        if config.reflect_model == config.fallback_model and config.fallback_api_base:
-            kwargs["api_base"] = config.fallback_api_base
+        model = config.reflect_model
+        api_base = ""
+        if model == config.fallback_model and config.fallback_api_base:
+            api_base = config.fallback_api_base
+        elif model == config.primary_model and config.primary_api_base:
+            api_base = config.primary_api_base
 
+        kwargs = _completion_kwargs(model, messages, None, api_base, stream=False)
         response = litellm.completion(**kwargs)
         raw_content = response.choices[0].message.content
         if not raw_content:
@@ -175,16 +292,12 @@ def batch_reflect(transcript: str, config: Config) -> dict:
             return {"memories": [], "inbox_question": ""}
         content = raw_content.strip()
 
-        # Parse JSON response (handles markdown fences, stray text, etc.)
         result = _extract_json(content)
 
-        # Validate structure
         raw_memories = result.get("memories", [])
         if not isinstance(raw_memories, list):
             raw_memories = [raw_memories]
 
-        # Normalize memories: accept both {"text": ..., "domain": ...} objects
-        # and plain strings (backward compatibility)
         memories = []
         for m in raw_memories:
             if not m:
@@ -207,12 +320,9 @@ def batch_reflect(transcript: str, config: Config) -> dict:
         }
 
     except json.JSONDecodeError as e:
-        # LLM didn't return valid JSON even after extraction attempts
         print(f"  [Warning] Reflection returned invalid JSON: {e}")
-        try:
+        if content:
             print(f"  Raw response: {content[:300]}")
-        except NameError:
-            pass
         return {"memories": [], "inbox_question": ""}
 
     except Exception as e:
