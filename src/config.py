@@ -121,7 +121,8 @@ def load_config(env_file: Optional[Path] = None) -> Config:
     # Validate required fields
     if not config.primary_model:
         print("\n[ERROR] PRIMARY_MODEL is not set in .env")
-        print("  Example: PRIMARY_MODEL=gemini/gemini-2.0-flash")
+        print("  Example: PRIMARY_MODEL=openai/<current-model-id>")
+        print("  (any current LiteLLM-compatible model string)")
         sys.exit(1)
 
     # Ensure data directories exist

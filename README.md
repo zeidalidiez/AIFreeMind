@@ -64,38 +64,33 @@ cp .env.example .env
 
 ### Configure `.env`
 
-Open `.env` and set your model and API key. Examples:
+Open `.env` and set **any current model** your provider supports. AIFreeMind routes through [LiteLLM](https://docs.litellm.ai/docs/providers), so model strings follow that provider’s format — we do **not** pin a specific generation (no “only GPT-4o / Claude Sonnet 4 / …” list). Use whatever is current for you.
 
-**OpenRouter:**
+Pattern: `PRIMARY_MODEL=<provider>/<model-id>` plus the matching API key (or local base URL).
+
 ```env
-PRIMARY_MODEL=openrouter/google/gemini-2.0-flash-001
+# OpenRouter (multi-provider gateway) — pick any current routed model
+PRIMARY_MODEL=openrouter/<provider>/<current-model-id>
 OPENROUTER_API_KEY=sk-or-v1-your-key-here
-```
 
-**OpenAI:**
-```env
-PRIMARY_MODEL=openai/gpt-4o-mini
+# OpenAI — any current chat model id
+PRIMARY_MODEL=openai/<current-model-id>
 OPENAI_API_KEY=sk-your-key-here
-```
 
-**Anthropic:**
-```env
-PRIMARY_MODEL=anthropic/claude-sonnet-4-20250514
+# Anthropic — any current Claude model id
+PRIMARY_MODEL=anthropic/<current-model-id>
 ANTHROPIC_API_KEY=sk-ant-your-key-here
-```
 
-**Google Gemini (direct):**
-```env
-PRIMARY_MODEL=gemini/gemini-2.0-flash
+# Google Gemini (direct) — any current Gemini model id
+PRIMARY_MODEL=gemini/<current-model-id>
 GEMINI_API_KEY=your-key-here
+
+# Ollama (fully local) — any model you have pulled
+PRIMARY_MODEL=ollama/<local-model-name>
+PRIMARY_API_BASE=http://localhost:11434
 ```
 
-**Ollama (fully local, free):**
-```env
-PRIMARY_MODEL=ollama/llama3
-PRIMARY_API_BASE=http://localhost:11434
-# No API key needed
-```
+See LiteLLM’s provider docs for exact model id strings as they change over time.
 
 ### Run
 
@@ -135,7 +130,7 @@ All settings live in `.env` — see `.env.example` for the full list.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `PRIMARY_MODEL` | *(required)* | LLM model for conversation |
+| `PRIMARY_MODEL` | *(required)* | Any current LiteLLM-compatible model string |
 | `PRIMARY_API_BASE` / `API_BASE` | *(optional)* | Custom API endpoint for **primary** (e.g. Ollama) |
 | `FALLBACK_MODEL` | *(optional)* | Backup model if primary fails |
 | `FALLBACK_API_BASE` | *(optional)* | Custom API endpoint for fallback |
