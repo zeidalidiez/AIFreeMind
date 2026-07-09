@@ -2,6 +2,8 @@
 
 **A persistent cognitive architecture for AI agents.**
 
+> **Proof of concept.** This project started as a personal experiment to understand agent memory and harness design a bit better — not a polished product. You’re welcome to use it, fork it, and change anything you need.
+
 AIFreeMind breaks the "single-prompt lifespan" of AI conversations. Instead of every session starting from scratch, your AI assistant builds and retains evolving memory — learning your preferences, recalling past decisions, and picking up threads of thought across sessions.
 
 ---
