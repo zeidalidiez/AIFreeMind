@@ -1,6 +1,9 @@
 # Environment & secrets
 .env
 
+# Local MCP / session tooling caches (not part of the app)
+mcps/
+
 # ChromaDB persistent storage
 db/
 
